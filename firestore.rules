@@ -1,0 +1,202 @@
+rules_version = '2';
+// ApnaKapda rules for the FREE (Spark) plan: no Cloud Functions, no custom claims.
+// Roles live in Firestore: admins/{uid} for admins, sellers/{uid}.status == 'approved' for sellers.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- helpers ----------
+    function signedIn() { return request.auth != null; }
+    function mine(uid) { return signedIn() && request.auth.uid == uid; }
+    function isAdmin() { return signedIn() && exists(/databases/$(database)/documents/admins/$(request.auth.uid)); }
+    function adminRole() { return get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.role; }
+    // super admin passes every check; other roles must be listed
+    function adminIn(roles) { return isAdmin() && (adminRole() == 'super' || adminRole() in roles); }
+    function isSeller() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/sellers/$(request.auth.uid))
+        && get(/databases/$(database)/documents/sellers/$(request.auth.uid)).data.status == 'approved'
+        && get(/databases/$(database)/documents/sellers/$(request.auth.uid)).data.get('blocked', false) == false;
+    }
+    function changed(keys) { return request.resource.data.diff(resource.data).affectedKeys().hasOnly(keys); }
+
+    // ---------- admins (first admin is created by hand in the Firebase console) ----------
+    match /admins/{uid} {
+      allow read: if mine(uid) || adminIn([]);
+      allow write: if adminIn([]);                       // only a super admin
+    }
+
+    // ---------- customers ----------
+    match /users/{uid} {
+      allow read: if mine(uid) || isAdmin();
+      allow create: if mine(uid)
+        && request.resource.data.keys().hasOnly(['name','email','mobile','createdAt'])
+        && request.resource.data.name is string && request.resource.data.name.size() <= 80;
+      allow update: if (mine(uid) && changed(['name','email','mobile','updatedAt'])) || adminIn(['support','order']);
+      allow delete: if mine(uid);
+
+      match /{sub}/{doc} {
+        allow read, write: if mine(uid) && sub in ['cart','wishlist','addresses'];
+        allow read, delete: if mine(uid) && sub == 'notifications';
+        allow update: if mine(uid) && sub == 'notifications' && changed(['read']);
+        allow create: if sub == 'notifications' && (isAdmin() || isSeller())
+          && request.resource.data.keys().hasOnly(['title','body','type','read','createdAt'])
+          && request.resource.data.read == false
+          && request.resource.data.title.size() <= 80 && request.resource.data.body.size() <= 300;
+        allow read: if isAdmin();
+      }
+    }
+
+    // ---------- sellers ----------
+    match /sellers/{uid} {
+      allow read: if mine(uid) || isAdmin();
+      allow create: if mine(uid)
+        && request.resource.data.status == 'pending'
+        && request.resource.data.keys().hasOnly(['ownerName','storeName','email','mobile','businessAddress','pickupAddress','bank','upi','kyc','status','createdAt']);
+      allow update: if (mine(uid) && resource.data.status in ['pending','approved']
+          && changed(['storeName','description','logoURL','bannerURL','businessAddress','pickupAddress','bank','upi','contactEmail','kyc','updatedAt']))
+        || adminIn(['seller']);                           // approve, reject, block, commission
+
+      // KYC papers: private. Only the seller and admins can read them. Never public.
+      match /kyc/{id} {
+        allow read: if mine(uid) || isAdmin();
+        allow create: if mine(uid)
+          && request.resource.data.keys().hasOnly(['name','type','data','createdAt'])
+          && request.resource.data.data is string && request.resource.data.data.size() < 900000;
+        allow delete: if adminIn(['seller'])
+          || (mine(uid) && get(/databases/$(database)/documents/sellers/$(uid)).data.status == 'pending');
+      }
+    }
+    // public store page (safe fields only), kept by the seller app
+    match /storefronts/{uid} {
+      allow read: if true;
+      allow create, update: if mine(uid) && isSeller()
+        && request.resource.data.keys().hasOnly(['storeName','description','logoURL','bannerURL','updatedAt']);
+      allow delete: if adminIn(['seller']);
+    }
+
+    // ---------- products ----------
+    function ownsProduct() { return isSeller() && resource.data.sellerId == request.auth.uid; }
+    function priceOk(d) { return d.price is number && d.price > 0 && d.mrp is number && d.price <= d.mrp; }
+    function statusMoveOk() {
+      let a = resource.data.status;
+      let b = request.resource.data.status;
+      return a == b || (a == 'live' && b == 'disabled') || (a == 'disabled' && b == 'live') || (a == 'rejected' && b == 'pending');
+    }
+    match /products/{id} {
+      allow read: if resource.data.status == 'live' || ownsProduct() || isAdmin();
+      allow create: if isSeller()
+        && request.resource.data.sellerId == request.auth.uid
+        && request.resource.data.status == 'pending'
+        && request.resource.data.sold == 0
+        && priceOk(request.resource.data)
+        && request.resource.data.keys().hasOnly(['sellerId','sellerName','sold','createdAt','name','category','gender','subCategory','description','price','mrp','discountPct','colors','sizes','stock','fabric','sku','weight','dimensions','returnable','exchangeable','images','status','updatedAt']);
+      allow update: if adminIn(['product'])
+        || (adminIn(['seller']) && changed(['status','updatedAt']))     // blocking a seller hides their products
+        || (ownsProduct() && priceOk(request.resource.data) && statusMoveOk()
+            && changed(['name','category','gender','subCategory','description','price','mrp','discountPct','colors','sizes','stock','fabric','sku','weight','dimensions','returnable','exchangeable','images','status','sold','updatedAt']));
+      allow delete: if adminIn(['product']) || ownsProduct();
+    }
+
+    // ---------- orders (customer app creates them, seller app moves them forward) ----------
+    function couponOk(d) {
+      return d.discount == 0
+        || (d.couponCode is string
+            && exists(/databases/$(database)/documents/coupons/$(d.couponCode))
+            && get(/databases/$(database)/documents/coupons/$(d.couponCode)).data.active == true
+            && d.discount <= get(/databases/$(database)/documents/coupons/$(d.couponCode)).data.maxDiscount);
+    }
+    function nextOk() {      let a = resource.data.status;
+      let b = request.resource.data.status;
+      return (a == 'new' && b == 'confirmed') || (a == 'confirmed' && b == 'packed') || (a == 'packed' && b == 'ready')
+          || (a == 'ready' && b == 'shipped') || (a == 'shipped' && b == 'delivered');
+    }
+    function sellerCancelOk() {
+      return request.resource.data.status == 'cancelled' && resource.data.status in ['new','confirmed'];
+    }
+    match /orders/{id} {
+      allow read: if (signedIn() && resource.data.customerId == request.auth.uid)
+                  || (isSeller() && resource.data.sellerId == request.auth.uid) || isAdmin();
+      allow create: if signedIn()
+        && request.resource.data.customerId == request.auth.uid
+        && request.resource.data.status == 'new'
+        && request.resource.data.paidOut == false
+        && (request.resource.data.payment.method == 'cod'
+            || (request.resource.data.payment.method == 'online' && request.resource.data.payment.status == 'pending'))
+        && request.resource.data.items is list && request.resource.data.items.size() >= 1 && request.resource.data.items.size() <= 30
+        && request.resource.data.itemsTotal is number && request.resource.data.itemsTotal > 0
+        && request.resource.data.discount is number && request.resource.data.discount >= 0
+        && request.resource.data.delivery is number && request.resource.data.delivery >= 0
+        && request.resource.data.total == request.resource.data.itemsTotal - request.resource.data.discount + request.resource.data.delivery
+        && get(/databases/$(database)/documents/sellers/$(request.resource.data.sellerId)).data.status == 'approved'
+        && couponOk(request.resource.data)
+        && !(exists(/databases/$(database)/documents/users/$(request.auth.uid))
+             && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('blocked', false) == true)
+        && request.resource.data.keys().hasOnly(['orderNo','groupId','customerId','customerName','customerPhone','sellerId','sellerName','items','productIds','itemsTotal','discount','delivery','total','couponCode','payment','address','status','paidOut','createdAt','updatedAt']);
+      allow update: if adminIn(['order'])
+        || (adminIn(['seller']) && changed(['paidOut','payoutId','updatedAt']))
+        || (isSeller() && resource.data.sellerId == request.auth.uid
+            && changed(['status','trackingId','updatedAt','cancelReason','cancelledBy'])
+            && (nextOk() || sellerCancelOk()))
+        || (signedIn() && resource.data.customerId == request.auth.uid
+            && resource.data.status == 'new' && request.resource.data.status == 'cancelled'
+            && changed(['status','updatedAt','cancelReason','cancelledBy']));
+      allow delete: if false;
+    }
+    match /returns/{id} {
+      allow read: if (signedIn() && resource.data.customerId == request.auth.uid)
+                  || (isSeller() && resource.data.sellerId == request.auth.uid) || isAdmin();
+      allow create: if signedIn()
+        && request.resource.data.customerId == request.auth.uid
+        && request.resource.data.status == 'requested'
+        && get(/databases/$(database)/documents/orders/$(request.resource.data.orderId)).data.customerId == request.auth.uid
+        && get(/databases/$(database)/documents/orders/$(request.resource.data.orderId)).data.status == 'delivered'
+        && request.resource.data.sellerId == get(/databases/$(database)/documents/orders/$(request.resource.data.orderId)).data.sellerId
+        && request.resource.data.keys().hasOnly(['orderId','customerId','sellerId','items','type','reason','amount','status','createdAt']);
+      allow update: if adminIn(['order']) || (adminIn(['seller']) && changed(['adjusted']));
+      allow delete: if false;
+    }
+    match /payouts/{id} {
+      allow read: if (isSeller() && resource.data.sellerId == request.auth.uid) || isAdmin();
+      allow write: if adminIn(['seller']);
+    }
+
+    // ---------- reviews (one per customer per product, delivered orders only) ----------
+    match /reviews/{id} {
+      allow read: if true;
+      allow create: if signedIn()
+        && id == request.auth.uid + '_' + request.resource.data.productId
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.rating is int && request.resource.data.rating >= 1 && request.resource.data.rating <= 5
+        && request.resource.data.text is string && request.resource.data.text.size() <= 1000
+        && get(/databases/$(database)/documents/orders/$(request.resource.data.orderId)).data.customerId == request.auth.uid
+        && get(/databases/$(database)/documents/orders/$(request.resource.data.orderId)).data.status == 'delivered'
+        && request.resource.data.productId in get(/databases/$(database)/documents/orders/$(request.resource.data.orderId)).data.productIds
+        && request.resource.data.keys().hasOnly(['userId','userName','productId','orderId','rating','text','createdAt']);
+      allow update: if signedIn() && resource.data.userId == request.auth.uid && changed(['text','rating','updatedAt'])
+        && request.resource.data.rating is int && request.resource.data.rating >= 1 && request.resource.data.rating <= 5;
+      allow delete: if (signedIn() && resource.data.userId == request.auth.uid) || adminIn(['support']);
+    }
+
+    // ---------- support ----------
+    match /tickets/{id} {
+      allow read: if (signedIn() && resource.data.userId == request.auth.uid) || isAdmin();
+      allow create: if signedIn() && request.resource.data.userId == request.auth.uid
+        && request.resource.data.status == 'open' && request.resource.data.from in ['customer','seller']
+        && request.resource.data.keys().hasOnly(['userId','from','name','category','subject','message','status','createdAt']);
+      allow update: if adminIn(['support']);
+    }
+
+    // ---------- store content managed by admin ----------
+    match /banners/{id}      { allow read: if true; allow write: if adminIn(['product']); }
+    match /categories/{id}   { allow read: if true; allow write: if adminIn(['product']); }
+    match /homeSections/{id} { allow read: if true; allow write: if adminIn(['product']); }
+    match /flashSales/{id}   { allow read: if true; allow write: if adminIn(['product']); }
+    match /coupons/{id} {
+      allow read: if resource.data.public == true || isAdmin();   // apps query where public == true
+      allow write: if adminIn(['product']);
+    }
+    match /settings/{id}     { allow read: if true; allow write: if adminIn([]); }   // super admin only
+    match /announcements/{id}{ allow read: if signedIn(); allow write: if adminIn(['product','support']); }
+    match /counters/{id}     { allow read, write: if adminIn(['seller']); }
+  }
+}
